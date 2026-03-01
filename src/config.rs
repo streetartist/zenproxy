@@ -63,6 +63,14 @@ pub struct ValidationConfig {
     pub concurrency: usize,
     pub interval_mins: u64,
     pub error_threshold: u32,
+    /// How many port slots to reserve for validation/quality-check per round.
+    /// The rest stay with Valid proxies serving users. Default 30.
+    #[serde(default = "default_validation_batch")]
+    pub batch_size: usize,
+}
+
+fn default_validation_batch() -> usize {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

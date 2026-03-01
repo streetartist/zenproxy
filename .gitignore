@@ -16,6 +16,10 @@
 /sing-box-dev-next/sing-box
 /sing-box-dev-next/sing-box.exe
 
+# sing-box-zenproxy build artifacts
+/sing-box-zenproxy/sing-box-linux-*
+/sing-box-zenproxy/sing-box-windows-*
+
 # IDE / OS
 .claude/
 .vscode/

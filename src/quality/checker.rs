@@ -280,6 +280,7 @@ async fn check_single(
         risk_score,
         risk_level,
         checked_at: Some(chrono::Utc::now().to_rfc3339()),
+        incomplete_retry_count: 0,
     })
 }
 

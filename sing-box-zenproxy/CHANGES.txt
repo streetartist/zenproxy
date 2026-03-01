@@ -1,0 +1,162 @@
+# sing-box 动态代理管理增强
+
+## 现有 sing-box 的缺陷
+
+### 1. 路由规则完全静态，无法运行时修改
+
+`Router.rules` 是一个普通 slice，在 `Initialize()` 时一次性构建，**没有锁保护，没有 Add/Remove 方法**。要改路由规则，只能重建整个 Box 实例（即完全重启）。
+
+```go
+// route/router.go — 原始代码
+type Router struct {
+    rules []adapter.Rule  // 静态，初始化后不可变
+    // 无 mutex，无动态操作方法
+}
+```
+
+### 2. Manager 有 Create/Remove，但路由断裂
+
+`OutboundManager` 和 `InboundManager` 都已实现运行时 `Create()` / `Remove()`：
+
+```go
+// adapter/outbound.go
+type OutboundManager interface {
+    Create(ctx, router, logger, tag, type, options) error  // ✅ 支持热添加
+    Remove(tag string) error                                // ✅ 支持热删除
+}
+```
+
+**但没有用**。因为即使动态创建了 inbound 和 outbound，Router 的路由规则是静态的——新建的 inbound 收到流量后，没有规则匹配它，流量只会走到 `final` 默认出口（通常是 `direct`），而不是你期望的代理 outbound。
+
+### 3. Clash API 只能切换 Selector，不能增删代理
+
+现有 Clash API 只暴露了：
+- `PUT /proxies/{name}` — 切换 Selector 组的选中项
+- `GET /proxies/{name}/delay` — 测延迟
+
+**没有**创建/删除 outbound 或 inbound 的 API。`/providers/proxies` 路由存在但**完全是空壳**（代码被注释掉了）。
+
+### 4. 配置重载 = 全量重启
+
+`StartOrReloadService()` 的实现是：
+
+```go
+// daemon/started_service.go
+func (s *StartedService) StartOrReloadService(...) error {
+    oldInstance.Close()           // 关闭一切
+    instance := s.newInstance()   // 从新配置创建全新 Box
+    instance.Start()              // 重新启动
+}
+```
+
+没有 diff、没有增量更新。每次"重载"都是完全销毁重建，所有连接断开。
+
+---
+
+## 我们做出的优化
+
+### 1. Router 添加 inbound→outbound 绑定表
+
+在 `Router` 中新增一个 `map[string]string` 绑定表，用 `RWMutex` 保护，支持运行时动态绑定：
+
+```go
+// route/router.go — 新增
+type Router struct {
+    // ...原有字段...
+    inboundBindings map[string]string   // inbound_tag → outbound_tag
+    bindingsMu      sync.RWMutex
+}
+
+func (r *Router) BindInboundOutbound(inboundTag, outboundTag string)
+func (r *Router) UnbindInbound(inboundTag string)
+```
+
+### 2. 路由快速路径：绑定直通
+
+在 `routeConnection()` 和 `routePacketConnection()` 中，**在规则匹配之前**插入绑定查找。命中绑定的流量直接路由到目标 outbound，完全跳过规则匹配，零开销：
+
+```go
+// route/route.go — TCP 路径
+r.bindingsMu.RLock()
+boundTag, hasBound := r.inboundBindings[metadata.Inbound]
+r.bindingsMu.RUnlock()
+if hasBound {
+    selectedOutbound, _ := r.outbound.Outbound(boundTag)
+    // 直接转发，跳过 matchRule
+    outboundHandler.NewConnectionEx(ctx, conn, metadata, onClose)
+    return nil
+}
+// 未绑定的流量走原有规则匹配逻辑，完全不受影响
+```
+
+**TCP 和 UDP 均已覆盖。**
+
+### 3. REST API：动态代理管理
+
+在 Clash API 上新增 `/bindings` 端点，一个请求完成 inbound + outbound + 路由绑定的创建/删除：
+
+| 方法 | 路径 | 功能 |
+|------|------|------|
+| `POST` | `/bindings` | 创建代理（inbound + outbound + 绑定） |
+| `DELETE` | `/bindings/{tag}` | 删除代理（解绑 + 移除 inbound + 移除 outbound） |
+| `GET` | `/bindings` | 列出所有动态代理 |
+
+**创建请求示例：**
+```json
+{
+    "tag": "proxy-0042",
+    "listen_port": 10042,
+    "outbound": {
+        "type": "shadowsocks",
+        "server": "1.2.3.4",
+        "server_port": 8388,
+        "method": "aes-256-gcm",
+        "password": "secret"
+    }
+}
+```
+
+**内部流程：**
+1. 解析 outbound JSON → 通过注册表创建正确的 option 结构体
+2. 调用 `OutboundManager.Create()` → 热启动 outbound（经过全部 4 个生命周期阶段）
+3. 自动创建 mixed (HTTP+SOCKS5) inbound，监听 `127.0.0.1:listen_port`
+4. 调用 `InboundManager.Create()` → 热启动 inbound
+5. 调用 `Router.BindInboundOutbound()` → 建立路由绑定
+6. 失败时自动回滚（先删 outbound，再返回错误）
+
+**删除流程：**
+1. `Router.UnbindInbound()` → 解除路由
+2. `InboundManager.Remove()` → 停止监听，关闭连接
+3. `OutboundManager.Remove()` → 关闭代理连接
+
+### 4. 接口契约更新
+
+`adapter.Router` 接口新增两个方法，确保类型安全：
+
+```go
+// adapter/router.go
+type Router interface {
+    // ...原有方法...
+    BindInboundOutbound(inboundTag, outboundTag string)
+    UnbindInbound(inboundTag string)
+}
+```
+
+---
+
+## 修改文件清单
+
+| 文件 | 改动 |
+|------|------|
+| `adapter/router.go` | Router 接口新增 `BindInboundOutbound` / `UnbindInbound` |
+| `route/router.go` | 新增 `inboundBindings` map + `RWMutex`，构造函数初始化，实现两个方法 |
+| `route/route.go` | TCP 和 UDP 路由函数中插入绑定快速路径 |
+| `experimental/clashapi/bindings.go` | **新文件**：`BindingManager` + REST API handlers |
+| `experimental/clashapi/server.go` | Server 新增 `bindingManager` 字段，注册 `/bindings` 路由 |
+
+## 设计原则
+
+- **零侵入**：未绑定的流量走原有规则匹配，行为完全不变
+- **读多写少**：绑定查找用 `RLock`（并发读不阻塞），绑定修改用 `Lock`
+- **事务性**：创建失败自动回滚，不会残留孤儿 inbound/outbound
+- **利用已有基础设施**：复用 Manager 的 `Create()`/`Remove()` 和 option 注册表的反序列化，不重复造轮子

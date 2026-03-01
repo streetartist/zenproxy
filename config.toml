@@ -24,6 +24,7 @@ timeout_secs = 10
 concurrency = 50
 interval_mins = 30
 error_threshold = 10
+batch_size = 30
 
 [quality]
 interval_mins = 120

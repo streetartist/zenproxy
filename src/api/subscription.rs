@@ -261,94 +261,120 @@ pub async fn refresh_subscription(
 }
 
 /// Sync proxy bindings dynamically without restarting sing-box.
+///
+/// Port pool total = max_proxies + batch_size.
+/// - Normal: top max_proxies Valid proxies get ports.
+/// - Validation: keep ALL Valid bindings untouched; Untested use extra batch_size ports.
+/// - QualityCheck: keep ALL Valid bindings; needs-quality use extra batch_size ports.
+/// Zero disruption to user traffic during validation/quality-check.
 pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) {
-    let mut all_proxies = state.pool.get_all();
+    let all_proxies = state.pool.get_all();
     if all_proxies.is_empty() {
-        // Remove all existing bindings
-        let current_ports: Vec<(String, u16)> = all_proxies
-            .iter()
-            .filter_map(|p| p.local_port.map(|port| (p.id.clone(), port)))
-            .collect();
-        if !current_ports.is_empty() {
-            let mut mgr = state.singbox.lock().await;
-            for (id, port) in &current_ports {
-                let _ = mgr.remove_binding(id, *port).await;
-            }
-        }
         return;
     }
 
     let max = state.config.singbox.max_proxies;
+    let batch = state.config.validation.batch_size;
+
+    // Snapshot ALL current ports before changes (for sync_bindings diff)
+    let all_current_ports: Vec<(String, u16)> = all_proxies
+        .iter()
+        .filter_map(|p| p.local_port.map(|port| (p.id.clone(), port)))
+        .collect();
+
+    // Classify proxies
+    let mut valid_with_port: Vec<PoolProxy> = Vec::new();
+    let mut valid_no_port: Vec<PoolProxy> = Vec::new();
+    let mut untested: Vec<PoolProxy> = Vec::new();
+    let mut invalid: Vec<PoolProxy> = Vec::new();
+    let mut needs_quality: Vec<PoolProxy> = Vec::new();
+
+    let now = chrono::Utc::now();
+    for p in all_proxies {
+        match p.status {
+            ProxyStatus::Valid => {
+                if matches!(mode, SyncMode::QualityCheck) && needs_quality_check(&p, &now) {
+                    needs_quality.push(p);
+                } else if p.local_port.is_some() {
+                    valid_with_port.push(p);
+                } else {
+                    valid_no_port.push(p);
+                }
+            }
+            ProxyStatus::Untested => untested.push(p),
+            ProxyStatus::Invalid => invalid.push(p),
+        }
+    }
+
+    valid_with_port.sort_by_key(|p| p.error_count);
+    valid_no_port.sort_by_key(|p| p.error_count);
+    untested.sort_by_key(|p| p.error_count);
+    needs_quality.sort_by_key(|p| p.error_count);
+
+    let mut selected: Vec<PoolProxy> = Vec::new();
 
     match mode {
+        SyncMode::Normal => {
+            // Valid first, fill up to max_proxies only (no extra ports)
+            let mut ordered = Vec::new();
+            ordered.extend(valid_with_port);
+            ordered.extend(valid_no_port);
+            ordered.extend(untested);
+            ordered.extend(invalid);
+            let cap = max.min(ordered.len());
+            selected = ordered.drain(..cap).collect();
+            for p in &ordered {
+                if p.local_port.is_some() {
+                    state.pool.clear_local_port(&p.id);
+                    state.db.update_proxy_local_port_null(&p.id).ok();
+                }
+            }
+        }
         SyncMode::Validation => {
-            // Untested first (they need testing), then Valid, then Invalid
-            all_proxies.sort_by(|a, b| {
-                let weight = |s: ProxyStatus| -> u8 {
-                    match s {
-                        ProxyStatus::Untested => 0,
-                        ProxyStatus::Valid => 1,
-                        ProxyStatus::Invalid => 2,
-                    }
-                };
-                weight(a.status)
-                    .cmp(&weight(b.status))
-                    .then_with(|| a.error_count.cmp(&b.error_count))
-            });
+            // Keep ALL Valid-with-port (up to max). Fill remaining normal slots with valid_no_port.
+            // Then use EXTRA batch_size ports (beyond max_proxies) for Untested.
+            let keep = valid_with_port.len().min(max);
+            selected.extend(valid_with_port.drain(..keep));
+            let normal_remaining = max.saturating_sub(selected.len());
+            let fill = normal_remaining.min(valid_no_port.len());
+            selected.extend(valid_no_port.drain(..fill));
+            // Extra ports for Untested — these use ports max_proxies+1 .. max_proxies+batch_size
+            let test_count = untested.len().min(batch);
+            selected.extend(untested.drain(..test_count));
+            // Clear ports for everything not selected
+            for p in valid_with_port.iter().chain(valid_no_port.iter())
+                .chain(untested.iter()).chain(invalid.iter())
+            {
+                if p.local_port.is_some() {
+                    state.pool.clear_local_port(&p.id);
+                    state.db.update_proxy_local_port_null(&p.id).ok();
+                }
+            }
         }
         SyncMode::QualityCheck => {
-            // Valid-without-quality first, then Valid-with-quality, then rest
-            all_proxies.sort_by(|a, b| {
-                let weight = |p: &PoolProxy| -> u8 {
-                    match p.status {
-                        ProxyStatus::Valid if p.quality.is_none() => 0,
-                        ProxyStatus::Valid => 1,
-                        ProxyStatus::Untested => 2,
-                        ProxyStatus::Invalid => 3,
-                    }
-                };
-                weight(a)
-                    .cmp(&weight(b))
-                    .then_with(|| a.error_count.cmp(&b.error_count))
-            });
-        }
-        SyncMode::Normal => {
-            // Valid first (serve traffic), then Untested, then Invalid
-            all_proxies.sort_by(|a, b| {
-                a.status
-                    .sort_weight()
-                    .cmp(&b.status.sort_weight())
-                    .then_with(|| a.error_count.cmp(&b.error_count))
-            });
+            // Keep ALL Valid-with-port. Use EXTRA batch_size ports for quality checks.
+            let keep = valid_with_port.len().min(max);
+            selected.extend(valid_with_port.drain(..keep));
+            let normal_remaining = max.saturating_sub(selected.len());
+            let fill = normal_remaining.min(valid_no_port.len());
+            selected.extend(valid_no_port.drain(..fill));
+            // Extra ports for quality checks
+            let check_count = needs_quality.len().min(batch);
+            selected.extend(needs_quality.drain(..check_count));
+            for p in valid_with_port.iter().chain(valid_no_port.iter())
+                .chain(needs_quality.iter()).chain(untested.iter()).chain(invalid.iter())
+            {
+                if p.local_port.is_some() {
+                    state.pool.clear_local_port(&p.id);
+                    state.db.update_proxy_local_port_null(&p.id).ok();
+                }
+            }
         }
     }
 
-    // Split into selected (get ports) and rest (ports cleared)
-    let cap = max.min(all_proxies.len());
-    let selected: Vec<_> = all_proxies.drain(..cap).collect();
-    let rest = all_proxies;
-
-    // Clear ports for proxies that won't be loaded
-    for p in &rest {
-        if p.local_port.is_some() {
-            state.pool.clear_local_port(&p.id);
-            state.db.update_proxy_local_port_null(&p.id).ok();
-        }
-    }
-
-    // Compute desired set and current bindings
     let desired: Vec<(String, serde_json::Value)> = selected
         .iter()
         .map(|p| (p.id.clone(), p.singbox_outbound.clone()))
-        .collect();
-
-    // Current ports: all proxies that currently have a local_port assigned
-    // (includes both selected and rest — rest ports already cleared above in pool but
-    //  we need the old state for sync_bindings to know what to remove)
-    let current_ports: Vec<(String, u16)> = selected
-        .iter()
-        .chain(rest.iter())
-        .filter_map(|p| p.local_port.map(|port| (p.id.clone(), port)))
         .collect();
 
     let mode_str = match mode {
@@ -357,20 +383,15 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) {
         SyncMode::QualityCheck => "quality-check",
     };
     tracing::info!(
-        "Syncing bindings for {}/{} proxies (max_proxies={}, mode={})",
-        selected.len(),
-        selected.len() + rest.len(),
-        max,
-        mode_str,
+        "Syncing bindings: {} selected (mode={}, max={}, batch={})",
+        selected.len(), mode_str, max, batch,
     );
 
-    // Sync via SingboxManager
     let mut mgr = state.singbox.lock().await;
-    let assignments = mgr.sync_bindings(&desired, &current_ports).await;
+    let assignments = mgr.sync_bindings(&desired, &all_current_ports).await;
     drop(mgr);
 
-    // Update pool and DB with new port assignments
-    // First clear all selected ports, then set the ones we got
+    // Update pool and DB
     for p in &selected {
         state.pool.clear_local_port(&p.id);
     }
@@ -378,8 +399,6 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) {
         state.pool.set_local_port(id, *port);
         state.db.update_proxy_local_port(id, *port as i32).ok();
     }
-
-    // Clear DB ports for proxies that didn't get assigned
     let assigned_ids: std::collections::HashSet<&str> =
         assignments.iter().map(|(id, _)| id.as_str()).collect();
     for p in &selected {
@@ -388,7 +407,28 @@ pub async fn sync_proxy_bindings(state: &Arc<AppState>, mode: SyncMode) {
         }
     }
 
-    // Invalidate cached relay clients for ports no longer in use
     let active_ports: Vec<u16> = assignments.iter().map(|(_, port)| *port).collect();
     crate::api::relay::invalidate_relay_clients(state, &active_ports);
+}
+
+/// Check if a proxy needs quality check (same logic as checker.rs)
+fn needs_quality_check(proxy: &PoolProxy, now: &chrono::DateTime<chrono::Utc>) -> bool {
+    match &proxy.quality {
+        None => true,
+        Some(q) => {
+            if q.country.is_none() || q.ip_type.is_none() || q.ip_address.is_none() || q.risk_level == "Unknown" {
+                return true;
+            }
+            if let Some(ref checked_str) = q.checked_at {
+                if let Ok(checked) = chrono::DateTime::parse_from_rfc3339(checked_str) {
+                    let age = *now - checked.with_timezone(&chrono::Utc);
+                    age.num_hours() >= 24
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        }
+    }
 }

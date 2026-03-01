@@ -48,14 +48,14 @@ impl PortPool {
 }
 
 impl SingboxManager {
-    pub fn new(config: SingboxConfig) -> Self {
+    pub fn new(config: SingboxConfig, extra_ports: u16) -> Self {
         let api_base = format!("http://127.0.0.1:{}", config.api_port);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("Failed to build HTTP client");
 
-        let max_ports = config.max_proxies as u16;
+        let max_ports = config.max_proxies as u16 + extra_ports;
         let base_port = config.base_port;
 
         SingboxManager {

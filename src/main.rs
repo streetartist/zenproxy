@@ -55,7 +55,7 @@ async fn main() {
     db.clear_all_proxy_local_ports().ok();
 
     // Initialize SingboxManager and start with minimal config
-    let mut manager = SingboxManager::new(config.singbox.clone());
+    let mut manager = SingboxManager::new(config.singbox.clone(), config.validation.batch_size as u16);
     if let Err(e) = manager.start().await {
         tracing::warn!("Failed to start sing-box: {e}");
     }

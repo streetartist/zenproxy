@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod client_fetch;
 pub mod fetch;
 pub mod relay;
 pub mod subscription;
@@ -55,6 +56,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // Fetch/Relay/Proxies routes — handler-level auth (API key or session)
     let fetch_relay_routes = Router::new()
         .route("/api/fetch", get(fetch::fetch_proxies))
+        .route("/api/client/fetch", get(client_fetch::client_fetch_proxies))
         .route("/api/proxies", get(fetch::list_all_proxies))
         .route(
             "/api/relay",

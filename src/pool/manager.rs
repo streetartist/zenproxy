@@ -205,6 +205,19 @@ impl ProxyPool {
         }
     }
 
+    pub fn update_proxy_config(&self, id: &str, name: &str, singbox_outbound: serde_json::Value) {
+        if let Some(mut proxy) = self.proxies.get_mut(id) {
+            proxy.name = name.to_string();
+            proxy.singbox_outbound = singbox_outbound;
+        }
+    }
+
+    pub fn increment_error(&self, id: &str) {
+        if let Some(mut proxy) = self.proxies.get_mut(id) {
+            proxy.error_count += 1;
+        }
+    }
+
     pub fn filter_proxies(&self, filter: &ProxyFilter) -> Vec<PoolProxy> {
         let candidates: Vec<PoolProxy> = self
             .proxies

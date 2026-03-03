@@ -58,6 +58,10 @@ func parseClashProxy(proxy map[string]interface{}) *ProxyConfig {
 		return parseClashSS(proxy, name, server, port)
 	case "hysteria2", "hy2":
 		return parseClashHysteria2(proxy, name, server, port)
+	case "socks5":
+		return parseClashSocks5(proxy, name, server, port)
+	case "http":
+		return parseClashHTTP(proxy, name, server, port)
 	}
 	return nil
 }
@@ -196,6 +200,47 @@ func parseClashHysteria2(proxy map[string]interface{}, name, server string, port
 
 	raw, _ := json.Marshal(outbound)
 	return &ProxyConfig{Name: name, Type: "hysteria2", Server: server, Port: port, Outbound: raw}
+}
+
+func parseClashSocks5(proxy map[string]interface{}, name, server string, port uint16) *ProxyConfig {
+	outbound := map[string]interface{}{
+		"type":        "socks",
+		"server":      server,
+		"server_port": port,
+		"version":     "5",
+	}
+
+	if username := yamlStr(proxy, "username"); username != "" {
+		outbound["username"] = username
+		outbound["password"] = yamlStr(proxy, "password")
+	}
+
+	if yamlBool(proxy, "tls") {
+		applyClashTLS(proxy, outbound, server)
+	}
+
+	raw, _ := json.Marshal(outbound)
+	return &ProxyConfig{Name: name, Type: "socks", Server: server, Port: port, Outbound: raw}
+}
+
+func parseClashHTTP(proxy map[string]interface{}, name, server string, port uint16) *ProxyConfig {
+	outbound := map[string]interface{}{
+		"type":        "http",
+		"server":      server,
+		"server_port": port,
+	}
+
+	if username := yamlStr(proxy, "username"); username != "" {
+		outbound["username"] = username
+		outbound["password"] = yamlStr(proxy, "password")
+	}
+
+	if yamlBool(proxy, "tls") {
+		applyClashTLS(proxy, outbound, server)
+	}
+
+	raw, _ := json.Marshal(outbound)
+	return &ProxyConfig{Name: name, Type: "http", Server: server, Port: port, Outbound: raw}
 }
 
 func applyClashTransport(proxy map[string]interface{}, outbound map[string]interface{}) {

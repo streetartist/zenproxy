@@ -41,6 +41,8 @@ ZenProxy 是一个代理池管理与转发服务，由两部分组成：
 - Trojan
 - Shadowsocks
 - Hysteria2
+- SOCKS5 / SOCKS4
+- HTTP / HTTPS
 
 ### 支持的订阅格式
 
@@ -48,8 +50,12 @@ ZenProxy 是一个代理池管理与转发服务，由两部分组成：
 |------|------|
 | `auto` | 自动检测（默认），依次尝试 Clash YAML → Base64 V2Ray → 原始 V2Ray URI |
 | `clash` | Clash YAML 格式（`proxies:` 字段） |
-| `v2ray` | V2Ray URI 格式，每行一个 `vmess://`、`vless://`、`trojan://` 等 |
+| `v2ray` | V2Ray URI 格式，每行一个 `vmess://`、`vless://`、`trojan://`、`socks5://`、`http://` 等 |
 | `base64` | Base64 编码的 V2Ray URI 列表 |
+| `socks5` | 纯文本 SOCKS5 代理列表，每行 `host:port` 或 `user:pass@host:port` |
+| `socks4` | 纯文本 SOCKS4 代理列表，格式同上 |
+| `http` | 纯文本 HTTP 代理列表，格式同上 |
+| `https` | 纯文本 HTTPS 代理列表，格式同上（启用 TLS） |
 
 ### 配置文件
 
@@ -88,6 +94,9 @@ error_threshold = 10                      # 连续失败超过此值删除代理
 [quality]
 interval_mins = 120                       # 质检间隔（分钟），实际不使用此字段
 concurrency = 10                          # 并发质检数
+
+[subscription]
+auto_refresh_interval_mins = 0            # 定时自动刷新间隔（分钟），0 = 禁用，例如 360 = 每 6 小时
 ```
 
 ### 认证方式
@@ -301,14 +310,30 @@ GET /api/proxies?api_key=xxx
 **触发时机：**
 - 导入/刷新订阅后**立即触发**
 - 定时任务：每 `validation.interval_mins` 分钟运行一次
+- 定时订阅刷新后自动触发（需开启 `auto_refresh_interval_mins`）
 
 **流程：**
-1. `sync_proxy_bindings(Validation)` — 优先为 Untested 代理分配端口
-2. 并发验证所有有端口的 Untested 代理
-3. 成功 → Valid，失败 → Invalid
-4. 如果 Untested 数量 > `max_proxies`，多轮循环直到全部验证完
-5. 无法获取绑定的代理（配置错误）直接标记为 Invalid
-6. 验证完成后执行 `sync_proxy_bindings(Normal)` 恢复正常端口分配
+1. 检查 Valid 代理中 `error_count > 0` 的（用户使用时失败过），重置为 Untested 重新验证
+2. `sync_proxy_bindings(Validation)` — 优先为 Untested 代理分配端口
+3. 并发验证所有有端口的 Untested 代理
+4. 成功 → Valid（error_count 清零），失败 → Invalid
+5. 如果 Untested 数量 > `max_proxies`，多轮循环直到全部验证完
+6. 无法获取绑定的代理（配置错误）直接标记为 Invalid
+7. 验证完成后执行 `sync_proxy_bindings(Normal)` 恢复正常端口分配
+
+**Relay 失败反馈：** 用户通过 `/api/relay` 使用代理失败时，该代理的 `error_count` 会自动增加。下次定时验证时，这些有错误的代理会被重新验证，不通过则标记为 Invalid 移除。
+
+#### 订阅自动刷新
+
+在 `config.toml` 中设置 `[subscription] auto_refresh_interval_mins`（非 0 值）即可启用定时自动刷新。
+
+**刷新策略（平滑替换）：**
+- 拉取/解析失败时，旧代理**完全不受影响**
+- 解析出 0 个代理时，中止刷新，保留旧数据
+- 对 (server, port, proxy_type) 相同的代理，**保留**其验证状态、端口绑定和质检数据
+- 仅新增的代理标记为 Untested 等待验证
+- 仅已消失的旧代理才会被删除
+- 全部刷新完成后统一触发一次验证
 
 #### 质量检测（Quality Check）
 

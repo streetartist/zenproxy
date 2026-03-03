@@ -14,6 +14,22 @@ pub async fn validate_all(state: Arc<AppState>) -> Result<(), String> {
         return Ok(());
     }
 
+    // Reset Valid proxies with error_count > 0 back to Untested so they get re-validated.
+    // This catches proxies that users reported as failing via relay.
+    let recheck: Vec<String> = state
+        .pool
+        .get_all()
+        .iter()
+        .filter(|p| p.status == ProxyStatus::Valid && p.error_count > 0)
+        .map(|p| p.id.clone())
+        .collect();
+    if !recheck.is_empty() {
+        tracing::info!("Re-validating {} proxies with relay errors", recheck.len());
+        for id in &recheck {
+            state.pool.set_status(id, ProxyStatus::Untested);
+        }
+    }
+
     let concurrency = state.config.validation.concurrency;
     let timeout_duration = std::time::Duration::from_secs(state.config.validation.timeout_secs);
     let validation_url = state.config.validation.url.clone();

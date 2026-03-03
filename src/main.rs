@@ -178,6 +178,20 @@ async fn start_background_tasks(state: Arc<AppState>) {
             state_clone.auth_cache.retain(|_, (_, expires)| now < *expires);
         }
     });
+
+    // Periodic subscription auto-refresh
+    if state.config.subscription.auto_refresh_interval_mins > 0 {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(
+                state_clone.config.subscription.auto_refresh_interval_mins * 60,
+            );
+            loop {
+                tokio::time::sleep(interval).await;
+                refresh_all_subscriptions(&state_clone).await;
+            }
+        });
+    }
 }
 
 async fn shutdown_signal() {
@@ -185,4 +199,54 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install Ctrl+C handler");
     tracing::info!("Received shutdown signal");
+}
+
+async fn refresh_all_subscriptions(state: &Arc<AppState>) {
+    let subs = match state.db.get_subscriptions() {
+        Ok(subs) => subs,
+        Err(e) => {
+            tracing::error!("Auto-refresh: failed to get subscriptions: {e}");
+            return;
+        }
+    };
+
+    let refreshable: Vec<_> = subs.into_iter().filter(|s| s.url.is_some()).collect();
+    if refreshable.is_empty() {
+        return;
+    }
+
+    tracing::info!("Auto-refreshing {} subscriptions...", refreshable.len());
+
+    let mut success = 0;
+    let mut failed = 0;
+    for sub in &refreshable {
+        match api::subscription::refresh_subscription_core(state, sub).await {
+            Ok(count) => {
+                tracing::info!(
+                    "Auto-refresh '{}': updated with {} proxies",
+                    sub.name,
+                    count
+                );
+                success += 1;
+            }
+            Err(e) => {
+                tracing::error!("Auto-refresh '{}' failed: {e}", sub.name);
+                failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        "Auto-refresh complete: {success} succeeded, {failed} failed"
+    );
+
+    // Run validation once after all subscriptions are refreshed
+    if success > 0 {
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pool::validator::validate_all(state2).await {
+                tracing::error!("Validation after auto-refresh failed: {e}");
+            }
+        });
+    }
 }

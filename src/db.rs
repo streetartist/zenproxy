@@ -336,6 +336,24 @@ impl Database {
         Ok(())
     }
 
+    pub fn increment_proxy_error_count(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE proxies SET error_count = error_count + 1, updated_at = ?1 WHERE id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_proxy_config(&self, id: &str, name: &str, config_json: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE proxies SET name = ?1, config_json = ?2, updated_at = ?3 WHERE id = ?4",
+            params![name, config_json, chrono::Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_proxy_local_port_null(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

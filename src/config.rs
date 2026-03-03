@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub validation: ValidationConfig,
     pub quality: QualityConfig,
     pub oauth: OAuthConfig,
+    #[serde(default)]
+    pub subscription: SubscriptionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +79,20 @@ fn default_validation_batch() -> usize {
 pub struct QualityConfig {
     pub interval_mins: u64,
     pub concurrency: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubscriptionConfig {
+    #[serde(default)]
+    pub auto_refresh_interval_mins: u64, // 0 = disabled
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            auto_refresh_interval_mins: 0,
+        }
+    }
 }
 
 impl AppConfig {

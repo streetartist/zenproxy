@@ -1,6 +1,7 @@
 pub mod v2ray;
 pub mod clash;
 pub mod base64;
+pub mod plain;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,8 @@ pub enum ProxyType {
     Trojan,
     Shadowsocks,
     Hysteria2,
+    Socks,
+    Http,
 }
 
 impl std::fmt::Display for ProxyType {
@@ -22,6 +25,8 @@ impl std::fmt::Display for ProxyType {
             ProxyType::Trojan => write!(f, "trojan"),
             ProxyType::Shadowsocks => write!(f, "shadowsocks"),
             ProxyType::Hysteria2 => write!(f, "hysteria2"),
+            ProxyType::Socks => write!(f, "socks"),
+            ProxyType::Http => write!(f, "http"),
         }
     }
 }
@@ -34,6 +39,8 @@ impl ProxyType {
             "trojan" => Some(ProxyType::Trojan),
             "ss" | "shadowsocks" => Some(ProxyType::Shadowsocks),
             "hy2" | "hysteria2" | "hysteria" => Some(ProxyType::Hysteria2),
+            "socks" | "socks5" | "socks4" => Some(ProxyType::Socks),
+            "http" | "https" => Some(ProxyType::Http),
             _ => None,
         }
     }
@@ -54,6 +61,7 @@ pub fn parse_subscription(content: &str, sub_type: &str) -> Vec<ProxyConfig> {
         "v2ray" => v2ray::parse(content),
         "clash" => clash::parse(content),
         "base64" => base64::parse(content),
+        "socks5" | "socks4" | "http" | "https" => plain::parse(content, sub_type),
         _ => {
             tracing::warn!("Unknown subscription type: {sub_type}, falling back to auto-detect");
             parse_subscription_auto(content)

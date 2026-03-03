@@ -35,6 +35,10 @@ func parseV2RayURI(uri string) *ProxyConfig {
 		return parseSS(uri)
 	case strings.HasPrefix(uri, "hy2://"), strings.HasPrefix(uri, "hysteria2://"):
 		return parseHysteria2(uri)
+	case strings.HasPrefix(uri, "socks://"), strings.HasPrefix(uri, "socks5://"), strings.HasPrefix(uri, "socks4://"):
+		return parseSocks(uri)
+	case strings.HasPrefix(uri, "http://"), strings.HasPrefix(uri, "https://"):
+		return parseHTTPProxy(uri)
 	}
 	return nil
 }
@@ -435,6 +439,145 @@ func parseHysteria2(uri string) *ProxyConfig {
 	return &ProxyConfig{
 		Name:     name,
 		Type:     "hysteria2",
+		Server:   server,
+		Port:     uint16(port),
+		Outbound: raw,
+	}
+}
+
+func parseSocks(uri string) *ProxyConfig {
+	// Determine version from scheme
+	version := "5"
+	var without string
+	switch {
+	case strings.HasPrefix(uri, "socks4://"):
+		without = strings.TrimPrefix(uri, "socks4://")
+		version = "4a"
+	case strings.HasPrefix(uri, "socks5://"):
+		without = strings.TrimPrefix(uri, "socks5://")
+	default:
+		without = strings.TrimPrefix(uri, "socks://")
+	}
+
+	mainPart, fragment := splitFragment(without)
+	name := urlDecode(fragment)
+
+	var username, password, hostPort string
+	if atIdx := strings.Index(mainPart, "@"); atIdx >= 0 {
+		userinfo := mainPart[:atIdx]
+		hostPort = mainPart[atIdx+1:]
+		if colonIdx := strings.Index(userinfo, ":"); colonIdx >= 0 {
+			username = userinfo[:colonIdx]
+			password = userinfo[colonIdx+1:]
+		} else {
+			username = userinfo
+		}
+	} else {
+		hostPort = mainPart
+	}
+
+	server, portStr := parseHostPort(hostPort)
+	if server == "" {
+		return nil
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil
+	}
+
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	outbound := map[string]interface{}{
+		"type":        "socks",
+		"server":      server,
+		"server_port": uint16(port),
+		"version":     version,
+	}
+
+	if username != "" {
+		outbound["username"] = username
+		outbound["password"] = password
+	}
+
+	raw, _ := json.Marshal(outbound)
+	return &ProxyConfig{
+		Name:     name,
+		Type:     "socks",
+		Server:   server,
+		Port:     uint16(port),
+		Outbound: raw,
+	}
+}
+
+func parseHTTPProxy(uri string) *ProxyConfig {
+	isHTTPS := strings.HasPrefix(uri, "https://")
+	var without string
+	if isHTTPS {
+		without = strings.TrimPrefix(uri, "https://")
+	} else {
+		without = strings.TrimPrefix(uri, "http://")
+	}
+
+	mainPart, fragment := splitFragment(without)
+	name := urlDecode(fragment)
+
+	// Remove path component
+	if slashIdx := strings.Index(mainPart, "/"); slashIdx >= 0 {
+		mainPart = mainPart[:slashIdx]
+	}
+
+	var username, password, hostPort string
+	if atIdx := strings.Index(mainPart, "@"); atIdx >= 0 {
+		userinfo := mainPart[:atIdx]
+		hostPort = mainPart[atIdx+1:]
+		if colonIdx := strings.Index(userinfo, ":"); colonIdx >= 0 {
+			username = userinfo[:colonIdx]
+			password = userinfo[colonIdx+1:]
+		} else {
+			username = userinfo
+		}
+	} else {
+		hostPort = mainPart
+	}
+
+	server, portStr := parseHostPort(hostPort)
+	if server == "" {
+		return nil
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil
+	}
+
+	if name == "" {
+		name = fmt.Sprintf("%s:%d", server, port)
+	}
+
+	outbound := map[string]interface{}{
+		"type":        "http",
+		"server":      server,
+		"server_port": uint16(port),
+	}
+
+	if username != "" {
+		outbound["username"] = username
+		outbound["password"] = password
+	}
+
+	if isHTTPS {
+		outbound["tls"] = map[string]interface{}{
+			"enabled":     true,
+			"server_name": server,
+			"insecure":    true,
+		}
+	}
+
+	raw, _ := json.Marshal(outbound)
+	return &ProxyConfig{
+		Name:     name,
+		Type:     "http",
 		Server:   server,
 		Port:     uint16(port),
 		Outbound: raw,

@@ -38,6 +38,8 @@ fn parse_clash_proxy(proxy: &serde_yaml::Value) -> Option<ProxyConfig> {
         "trojan" => parse_clash_trojan(proxy, &name, &server, port),
         "ss" => parse_clash_ss(proxy, &name, &server, port),
         "hysteria2" | "hy2" => parse_clash_hysteria2(proxy, &name, &server, port),
+        "socks5" => parse_clash_socks(proxy, &name, &server, port),
+        "http" => parse_clash_http(proxy, &name, &server, port),
         _ => None,
     }
 }
@@ -232,6 +234,88 @@ fn parse_clash_hysteria2(
     Some(ProxyConfig {
         name: name.to_string(),
         proxy_type: ProxyType::Hysteria2,
+        server: server.to_string(),
+        port,
+        singbox_outbound: outbound,
+    })
+}
+
+fn parse_clash_socks(
+    proxy: &serde_yaml::Value,
+    name: &str,
+    server: &str,
+    port: u16,
+) -> Option<ProxyConfig> {
+    let mut outbound = json!({
+        "type": "socks",
+        "server": server,
+        "server_port": port,
+        "version": "5",
+    });
+
+    if let Some(username) = proxy.get("username").and_then(|u| u.as_str()) {
+        if !username.is_empty() {
+            outbound["username"] = json!(username);
+            let password = proxy
+                .get("password")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            outbound["password"] = json!(password);
+        }
+    }
+
+    // Some Clash configs use "tls" field for socks5
+    let tls_enabled = proxy
+        .get("tls")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    if tls_enabled {
+        apply_clash_tls(proxy, &mut outbound, server);
+    }
+
+    Some(ProxyConfig {
+        name: name.to_string(),
+        proxy_type: ProxyType::Socks,
+        server: server.to_string(),
+        port,
+        singbox_outbound: outbound,
+    })
+}
+
+fn parse_clash_http(
+    proxy: &serde_yaml::Value,
+    name: &str,
+    server: &str,
+    port: u16,
+) -> Option<ProxyConfig> {
+    let mut outbound = json!({
+        "type": "http",
+        "server": server,
+        "server_port": port,
+    });
+
+    if let Some(username) = proxy.get("username").and_then(|u| u.as_str()) {
+        if !username.is_empty() {
+            outbound["username"] = json!(username);
+            let password = proxy
+                .get("password")
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
+            outbound["password"] = json!(password);
+        }
+    }
+
+    let tls_enabled = proxy
+        .get("tls")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    if tls_enabled {
+        apply_clash_tls(proxy, &mut outbound, server);
+    }
+
+    Some(ProxyConfig {
+        name: name.to_string(),
+        proxy_type: ProxyType::Http,
         server: server.to_string(),
         port,
         singbox_outbound: outbound,

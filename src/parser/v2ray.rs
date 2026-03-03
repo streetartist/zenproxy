@@ -21,6 +21,10 @@ pub fn parse_uri(uri: &str) -> Option<ProxyConfig> {
         parse_ss(uri)
     } else if uri.starts_with("hy2://") || uri.starts_with("hysteria2://") {
         parse_hysteria2(uri)
+    } else if uri.starts_with("socks://") || uri.starts_with("socks5://") || uri.starts_with("socks4://") {
+        parse_socks(uri)
+    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+        parse_http_proxy(uri)
     } else {
         None
     }
@@ -318,6 +322,126 @@ fn parse_hysteria2(uri: &str) -> Option<ProxyConfig> {
     Some(ProxyConfig {
         name: display_name,
         proxy_type: ProxyType::Hysteria2,
+        server: server.to_string(),
+        port,
+        singbox_outbound: outbound,
+    })
+}
+
+fn parse_socks(uri: &str) -> Option<ProxyConfig> {
+    // Determine SOCKS version from scheme
+    let (without_scheme, version) = if uri.starts_with("socks4://") {
+        (uri.strip_prefix("socks4://")?, "4a")
+    } else if uri.starts_with("socks5://") {
+        (uri.strip_prefix("socks5://")?, "5")
+    } else {
+        (uri.strip_prefix("socks://")?, "5")
+    };
+
+    let (main_part, fragment) = without_scheme.rsplit_once('#').unwrap_or((without_scheme, ""));
+    let name = percent_encoding::percent_decode_str(fragment)
+        .decode_utf8_lossy()
+        .to_string();
+
+    let (username, password, host_port) = if main_part.contains('@') {
+        let (userinfo, hp) = main_part.split_once('@')?;
+        if let Some((user, pass)) = userinfo.split_once(':') {
+            (user.to_string(), pass.to_string(), hp)
+        } else {
+            (userinfo.to_string(), String::new(), hp)
+        }
+    } else {
+        (String::new(), String::new(), main_part)
+    };
+
+    let (server, port_str) = parse_host_port(host_port)?;
+    let port: u16 = port_str.parse().ok()?;
+
+    if server.is_empty() || port == 0 {
+        return None;
+    }
+
+    let display_name = if name.is_empty() { format!("{server}:{port}") } else { name };
+
+    let mut outbound = json!({
+        "type": "socks",
+        "server": server,
+        "server_port": port,
+        "version": version,
+    });
+
+    if !username.is_empty() {
+        outbound["username"] = json!(username);
+        outbound["password"] = json!(password);
+    }
+
+    Some(ProxyConfig {
+        name: display_name,
+        proxy_type: ProxyType::Socks,
+        server: server.to_string(),
+        port,
+        singbox_outbound: outbound,
+    })
+}
+
+fn parse_http_proxy(uri: &str) -> Option<ProxyConfig> {
+    let is_https = uri.starts_with("https://");
+    let without_scheme = if is_https {
+        uri.strip_prefix("https://")?
+    } else {
+        uri.strip_prefix("http://")?
+    };
+
+    let (main_part, fragment) = without_scheme.rsplit_once('#').unwrap_or((without_scheme, ""));
+    let name = percent_encoding::percent_decode_str(fragment)
+        .decode_utf8_lossy()
+        .to_string();
+
+    // Remove path component (e.g. trailing /)
+    let main_part = main_part.split('/').next().unwrap_or(main_part);
+
+    let (username, password, host_port) = if main_part.contains('@') {
+        let (userinfo, hp) = main_part.split_once('@')?;
+        if let Some((user, pass)) = userinfo.split_once(':') {
+            (user.to_string(), pass.to_string(), hp)
+        } else {
+            (userinfo.to_string(), String::new(), hp)
+        }
+    } else {
+        (String::new(), String::new(), main_part)
+    };
+
+    let (server, port_str) = parse_host_port(host_port)?;
+    let port: u16 = port_str.parse().ok()?;
+
+    if server.is_empty() || port == 0 {
+        return None;
+    }
+
+    let display_name = if name.is_empty() { format!("{server}:{port}") } else { name };
+
+    let mut outbound = json!({
+        "type": "http",
+        "server": server,
+        "server_port": port,
+    });
+
+    if !username.is_empty() {
+        outbound["username"] = json!(username);
+        outbound["password"] = json!(password);
+    }
+
+    if is_https {
+        outbound["tls"] = json!({
+            "enabled": true,
+            "server_name": server,
+            "insecure": true,
+        });
+    }
+
+    Some(ProxyConfig {
+        name: display_name,
+        proxy_type: ProxyType::Http,
         server: server.to_string(),
         port,
         singbox_outbound: outbound,

@@ -130,6 +130,9 @@ pub async fn relay_request(
             }
             Err(e) => {
                 tracing::debug!("Relay attempt {} failed with proxy {}: {e}", attempt + 1, proxy.name);
+                // Mark proxy as having a failure so periodic validation will re-check it
+                state.pool.increment_error(&proxy.id);
+                state.db.increment_proxy_error_count(&proxy.id).ok();
                 continue;
             }
         }

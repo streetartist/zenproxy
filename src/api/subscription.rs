@@ -167,6 +167,137 @@ pub async fn delete_subscription(
     Ok(Json(json!({ "message": "Subscription deleted" })))
 }
 
+/// Core logic for refreshing a subscription: fetch content, parse, replace proxies.
+/// Returns the number of new proxies added, or an error message.
+/// Does NOT spawn validation — the caller decides when/how to validate.
+///
+/// This uses a **smooth replacement** strategy:
+/// 1. Fetch & parse first — if it fails, old proxies are untouched.
+/// 2. If parse returns 0 proxies, abort (don't wipe the subscription).
+/// 3. For proxies whose (server, port, proxy_type) match an existing one,
+///    preserve their validation status, error_count, local_port and quality data.
+/// 4. Only then remove old proxies that no longer appear in the new list.
+pub async fn refresh_subscription_core(state: &Arc<AppState>, sub: &Subscription) -> Result<usize, String> {
+    let content = if let Some(ref url) = sub.url {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch: {e}"))?;
+        resp.text()
+            .await
+            .map_err(|e| format!("Failed to read: {e}"))?
+    } else if let Some(ref content) = sub.content {
+        content.clone()
+    } else {
+        return Err("No URL or content to refresh".into());
+    };
+
+    let parsed = parser::parse_subscription(&content, &sub.sub_type);
+    if parsed.is_empty() {
+        return Err("Parsed 0 proxies, keeping existing data".into());
+    }
+
+    // Collect old proxies for this subscription, keyed by (server, port, proxy_type)
+    let old_proxies: Vec<PoolProxy> = state
+        .pool
+        .get_all()
+        .into_iter()
+        .filter(|p| p.subscription_id == sub.id)
+        .collect();
+    let mut old_map: std::collections::HashMap<(String, u16, String), PoolProxy> = old_proxies
+        .iter()
+        .map(|p| ((p.server.clone(), p.port, p.proxy_type.clone()), p.clone()))
+        .collect();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut added = 0;
+    let mut kept_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for pc in &parsed {
+        let key = (pc.server.clone(), pc.port, pc.proxy_type.to_string());
+
+        if let Some(old) = old_map.remove(&key) {
+            // Same proxy still exists — update config but preserve status
+            kept_ids.insert(old.id.clone());
+
+            // Update the outbound config in DB (it may have changed)
+            let new_config = serde_json::to_string(&pc.singbox_outbound).unwrap_or_default();
+            state.db.update_proxy_config(&old.id, &pc.name, &new_config)
+                .map_err(|e| format!("Failed to update proxy config: {e}"))?;
+
+            // Update pool entry's name and outbound (keep status, local_port, etc.)
+            state.pool.update_proxy_config(&old.id, &pc.name, pc.singbox_outbound.clone());
+
+            added += 1;
+        } else {
+            // New proxy — insert fresh
+            let proxy_id = uuid::Uuid::new_v4().to_string();
+            let proxy_row = ProxyRow {
+                id: proxy_id.clone(),
+                subscription_id: sub.id.clone(),
+                name: pc.name.clone(),
+                proxy_type: pc.proxy_type.to_string(),
+                server: pc.server.clone(),
+                port: pc.port as i32,
+                config_json: serde_json::to_string(&pc.singbox_outbound).unwrap_or_default(),
+                is_valid: false,
+                local_port: None,
+                error_count: 0,
+                last_error: None,
+                last_validated: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            state.db.insert_proxy(&proxy_row)
+                .map_err(|e| format!("Failed to insert proxy: {e}"))?;
+
+            let pool_proxy = PoolProxy {
+                id: proxy_id,
+                subscription_id: sub.id.clone(),
+                name: pc.name.clone(),
+                proxy_type: pc.proxy_type.to_string(),
+                server: pc.server.clone(),
+                port: pc.port,
+                singbox_outbound: pc.singbox_outbound.clone(),
+                status: ProxyStatus::Untested,
+                local_port: None,
+                error_count: 0,
+                quality: None,
+            };
+            state.pool.add(pool_proxy);
+            added += 1;
+        }
+    }
+
+    // Remove old proxies that no longer appear in the new list
+    let removed: Vec<String> = old_map.values().map(|p| p.id.clone()).collect();
+    for id in &removed {
+        state.pool.remove(id);
+        state.db.delete_proxy(id).ok();
+    }
+
+    state
+        .db
+        .update_subscription_proxy_count(&sub.id, added as i32)
+        .map_err(|e| format!("Failed to update proxy count: {e}"))?;
+
+    if !removed.is_empty() {
+        tracing::info!(
+            "Refresh '{}': kept {}, new {}, removed {}",
+            sub.name, kept_ids.len(),
+            added - kept_ids.len(), removed.len()
+        );
+    }
+
+    Ok(added)
+}
+
 pub async fn refresh_subscription(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -176,75 +307,9 @@ pub async fn refresh_subscription(
         .get_subscription(&id)?
         .ok_or_else(|| AppError::NotFound("Subscription not found".into()))?;
 
-    let content = if let Some(ref url) = sub.url {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to fetch: {e}")))?;
-        resp.text()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to read: {e}")))?
-    } else if let Some(ref content) = sub.content {
-        content.clone()
-    } else {
-        return Err(AppError::BadRequest("No URL or content to refresh".into()));
-    };
-
-    let parsed = parser::parse_subscription(&content, &sub.sub_type);
-
-    // Delete old proxies for this subscription
-    state.pool.remove_by_subscription(&id);
-    state.db.delete_proxies_by_subscription(&id)?;
-
-    // Insert new proxies
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut added = 0;
-    for pc in &parsed {
-        let proxy_id = uuid::Uuid::new_v4().to_string();
-        let proxy_row = ProxyRow {
-            id: proxy_id.clone(),
-            subscription_id: id.clone(),
-            name: pc.name.clone(),
-            proxy_type: pc.proxy_type.to_string(),
-            server: pc.server.clone(),
-            port: pc.port as i32,
-            config_json: serde_json::to_string(&pc.singbox_outbound).unwrap_or_default(),
-            is_valid: false,
-            local_port: None,
-            error_count: 0,
-            last_error: None,
-            last_validated: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        state.db.insert_proxy(&proxy_row)?;
-
-        let pool_proxy = PoolProxy {
-            id: proxy_id,
-            subscription_id: id.clone(),
-            name: pc.name.clone(),
-            proxy_type: pc.proxy_type.to_string(),
-            server: pc.server.clone(),
-            port: pc.port,
-            singbox_outbound: pc.singbox_outbound.clone(),
-            status: ProxyStatus::Untested,
-            local_port: None,
-            error_count: 0,
-            quality: None,
-        };
-        state.pool.add(pool_proxy);
-        added += 1;
-    }
-
-    state
-        .db
-        .update_subscription_proxy_count(&id, added as i32)?;
+    let added = refresh_subscription_core(&state, &sub)
+        .await
+        .map_err(|e| AppError::Internal(e))?;
 
     // Validate in background
     let state2 = state.clone();

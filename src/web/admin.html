@@ -161,6 +161,19 @@ tr:hover td { background:rgba(108,99,255,.03); }
             <label>名称</label>
             <input id="add-sub-name" placeholder="我的代理列表">
           </div>
+          <div class="form-group">
+            <label>类型</label>
+            <select id="add-sub-type">
+              <option value="auto">自动检测</option>
+              <option value="v2ray">V2Ray URI</option>
+              <option value="clash">Clash YAML</option>
+              <option value="base64">Base64</option>
+              <option value="socks5">SOCKS5 (纯文本)</option>
+              <option value="socks4">SOCKS4 (纯文本)</option>
+              <option value="http">HTTP (纯文本)</option>
+              <option value="https">HTTPS (纯文本)</option>
+            </select>
+          </div>
         </div>
         <div>
           <div class="form-group">
@@ -169,7 +182,7 @@ tr:hover td { background:rgba(108,99,255,.03); }
           </div>
           <div class="form-group">
             <label>或粘贴内容</label>
-            <textarea id="add-sub-content" placeholder="在此粘贴订阅内容..."></textarea>
+            <textarea id="add-sub-content" placeholder="在此粘贴订阅内容...&#10;SOCKS5/HTTP 纯文本格式: 每行一个 host:port 或 user:pass@host:port"></textarea>
           </div>
         </div>
       </div>
@@ -425,11 +438,12 @@ async function loadSubscriptions() {
 
 async function adminAddSubscription() {
   const name = document.getElementById('add-sub-name').value.trim();
+  const subType = document.getElementById('add-sub-type').value;
   const url = document.getElementById('add-sub-url').value.trim();
   const content = document.getElementById('add-sub-content').value.trim();
   if (!name) return toast('请输入名称');
   if (!url && !content) return toast('请输入 URL 或粘贴内容');
-  const body = { name };
+  const body = { name, type: subType };
   if (url) body.url = url;
   else body.content = content;
   toast('正在添加订阅...');
@@ -441,6 +455,7 @@ async function adminAddSubscription() {
   if (d && d.subscription) {
     toast(`已添加 ${d.proxies_added} 个代理`);
     document.getElementById('add-sub-name').value = '';
+    document.getElementById('add-sub-type').value = 'auto';
     document.getElementById('add-sub-url').value = '';
     document.getElementById('add-sub-content').value = '';
     refresh();
